@@ -35,6 +35,10 @@ def is_sleep_line(line: str) -> bool:
 STATE_DIR = Path.home() / ".local/state/llama-watcher"
 STATE_FILE = STATE_DIR / "state.json"
 
+# Touching this file (host-mounted into the container) tells the combined
+# supervisor (start_all.sh) to restart ONLY llama-server, leaving CrispASR up.
+RELOAD_TRIGGER = Path("/home/nikita/models/.llama-reload")
+
 
 def log(msg: str) -> None:
     print(f"[llama-watcher] {msg}", flush=True)
@@ -124,16 +128,13 @@ def is_service_active() -> bool:
 
 
 def run_action() -> None:
-    log(f"running: systemctl --user {ACTION} {LOG_UNIT}")
+    log(f"idle recycle: touching {RELOAD_TRIGGER} to reload llama only "
+        f"(keeps CrispASR up)")
     try:
-        subprocess.run(
-            ["systemctl", "--user", ACTION, LOG_UNIT],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        RELOAD_TRIGGER.parent.mkdir(parents=True, exist_ok=True)
+        RELOAD_TRIGGER.touch()
     except Exception as e:
-        log(f"action failed: {e}")
+        log(f"trigger touch failed: {e}")
 
 
 _stop = False
