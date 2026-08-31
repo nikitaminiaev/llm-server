@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 $PYTHON*.pyc
+
+# backup artifacts
+start_all.sh.bak-*
