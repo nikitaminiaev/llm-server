@@ -11,6 +11,11 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVICE="$HOME/.config/systemd/user/llama-server.service"
 IMAGE_PREFIX="docker.io/kyuz0/amd-strix-halo-toolboxes"
+# Стартовый скрипт llama-сервиса из юнита (для проверки /health).
+# На главной это start_server.sh; на второй машине — start_all.sh (supervisor,
+# который дополнительно запускает CrispASR). Переопределяется env-переменной.
+START_SCRIPT="${LLAMA_START_SCRIPT:-/home/nikita/models/config/start_server.sh}"
+START_BASENAME="$(basename "$START_SCRIPT")"
 YES=0
 NEW_NUM=""
 
@@ -68,20 +73,20 @@ echo ">> Проверка GPU в контейнере"
 distrobox enter "$NEW_CONTAINER" -- llama-cli --list-devices || fail "llama-cli --list-devices не показал устройства"
 
 echo ">> Запуск сервера для проверки"
-distrobox enter "$NEW_CONTAINER" -- /home/nikita/models/config/start_server.sh >/tmp/llama-rocm-update-server.log 2>&1 &
+distrobox enter "$NEW_CONTAINER" -- "$START_SCRIPT" >/tmp/llama-rocm-update-server.log 2>&1 &
 sleep 20
 if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
   echo ">> /health OK"
 else
   echo ">> /health не ответил за 20с, лог:" >&2
   tail -30 /tmp/llama-rocm-update-server.log >&2
-  pkill -f "llama-rocm-${NEW_NUM}.*start_server.sh" 2>/dev/null
+  pkill -f "llama-rocm-${NEW_NUM}.*${START_BASENAME}" 2>/dev/null
   fail "сервер в новом контейнере не отвечает"
 fi
 
 # Остановка тестового сервера: podman stop контейнера гарантированно убивает
 # и фоновый podman exec, и llama-server внутри (иначе порт 8080 остаётся занят).
-pkill -f "llama-rocm-${NEW_NUM}.*start_server.sh" 2>/dev/null
+pkill -f "llama-rocm-${NEW_NUM}.*${START_BASENAME}" 2>/dev/null
 podman stop --time 5 "$NEW_CONTAINER" 2>/dev/null || true
 sleep 3
 # Юнит сам поднимет контейнер и сервер на шаге enable --now.
