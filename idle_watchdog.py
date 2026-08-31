@@ -114,6 +114,24 @@ def has_activity_since(ts: datetime) -> bool:
     return False
 
 
+REQUEST_RE = re.compile(r"\bslot\b.*\brelease\b.*\bstop processing: n_tokens")
+
+
+def has_request_activity_since(ts: datetime) -> bool:
+    """True if a real inference request was served since ts.
+
+    Matches only the completion lines emitted when a generation finishes
+    ("slot release ... stop processing: n_tokens = N"). These appear solely
+    for actual requests, not for server startup or model unload, so they are
+    a reliable signal that a model was reloaded and used again after unload.
+    """
+    out = journal(since=ts)
+    for line in out.splitlines():
+        if REQUEST_RE.search(line):
+            return True
+    return False
+
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
@@ -216,6 +234,17 @@ def check_shutdown(state: dict, now: datetime) -> bool:
     unload_iso = state.get("last_action_iso") or state.get("last_unload_iso")
     unload = parse_ts(unload_iso) if unload_iso else None
     if unload is None:
+        return False
+
+    if has_request_activity_since(unload):
+        log("new inference request after unload: models reloaded, "
+            "reset shutdown countdown")
+        state["action_taken"] = False
+        state["last_action_iso"] = None
+        state["last_sleep_iso"] = None
+        state["shutdown_countdown"] = False
+        state["last_unload_iso"] = None
+        save_state(state)
         return False
 
     last_session_iso = state.get("last_session_iso")
