@@ -3,8 +3,17 @@
 
 Polls the journal of llama-server.service for the "entering sleeping state"
 marker emitted by llama.cpp's router when a model server becomes idle. After
-a configurable grace period with no further activity, restarts the service
-so the loaded models are dropped from VRAM and the iGPU can power down.
+a configurable grace period with no further activity, reloads the models so
+they are dropped from VRAM and the iGPU can power down.
+
+On this host (node) the reload is done by touching RELOAD_TRIGGER so the
+combined supervisor (start_all.sh) restarts ONLY llama-server, leaving the
+CrispASR service up. On the master host this would be a systemd restart.
+
+Shutdown logic: once the models have been unloaded (reload/restart happened)
+and no SSH session has been active for a grace period, and no tmux session
+exists, the host is powered off (sudo -n shutdown -h now). Any new SSH/tmux
+activity cancels the pending shutdown.
 
 Runs as a standalone systemd --user service. Does not modify any existing
 configuration of llama-server.
@@ -27,6 +36,14 @@ LOG_UNIT = "llama-server.service"
 SLEEP_MARKER = "entering sleeping state"
 SLEEP_LINE_RE = re.compile(r"\bsleep\w*", re.IGNORECASE)
 ACTION = "restart"
+
+# Shutdown conditions ---
+# 1) How long the models must have been unloaded before shutdown is considered.
+SHUTDOWN_GRACE = 60 * 60
+# 2) Max idle time of the most-recently-active SSH session before shutdown.
+SSH_GRACE = 30 * 60
+SHUTDOWN_CMD = ["sudo", "-n", "shutdown", "-h", "now"]
+SHUTDOWN_DRYRUN = False
 
 
 def is_sleep_line(line: str) -> bool:
@@ -68,9 +85,11 @@ def parse_ts(line: str) -> datetime | None:
     head = line.split(" ", 1)[0]
     try:
         dt = datetime.fromisoformat(head)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(tz=None).replace(tzinfo=None)
+        # Naive timestamps (as written by datetime.now().isoformat()) are
+        # already local wall-clock time; leave them as-is.
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(tz=None).replace(tzinfo=None)
+        return dt
     except ValueError:
         return None
 
@@ -106,6 +125,9 @@ def load_state() -> dict:
         "action_taken": False,
         "last_action_iso": None,
         "last_seen_sleep_iso": None,
+        "shutdown_countdown": False,
+        "last_unload_iso": None,
+        "last_session_iso": None,
     }
 
 
@@ -137,6 +159,46 @@ def run_action() -> None:
         log(f"trigger touch failed: {e}")
 
 
+def has_ssh_sessions() -> bool:
+    """True if any SSH session is present (via `w -h`, lines with pts/*)."""
+    try:
+        out = subprocess.run(
+            ["w", "-h"], capture_output=True, text=True, timeout=10
+        ).stdout
+        return any("pts/" in line for line in out.splitlines())
+    except Exception as e:
+        log(f"w -h failed: {e}")
+        return True
+
+
+def has_tmux_sessions() -> bool:
+    """True if any tmux session exists (`tmux list-sessions` exit 0)."""
+    try:
+        r = subprocess.run(
+            ["tmux", "list-sessions"], capture_output=True, text=True, timeout=10
+        )
+        return r.returncode == 0
+    except Exception as e:
+        log(f"tmux list-sessions failed: {e}")
+        return True
+
+
+def has_blocking_sessions() -> bool:
+    """Blocking activity: an SSH session or a tmux session."""
+    return has_ssh_sessions() or has_tmux_sessions()
+
+
+def run_shutdown() -> None:
+    if SHUTDOWN_DRYRUN:
+        log(f"DRYRUN would run: {SHUTDOWN_CMD}")
+        return
+    log(f"running: {' '.join(SHUTDOWN_CMD)}")
+    try:
+        subprocess.run(SHUTDOWN_CMD, capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        log(f"shutdown failed: {e}")
+
+
 _stop = False
 
 
@@ -146,13 +208,72 @@ def _on_signal(signum, frame):
     _stop = True
 
 
+def check_shutdown(state: dict, now: datetime) -> bool:
+    """Evaluate shutdown conditions once the models are unloaded.
+
+    Returns True if shutdown was issued. Updates and saves state as needed.
+    """
+    unload_iso = state.get("last_action_iso") or state.get("last_unload_iso")
+    unload = parse_ts(unload_iso) if unload_iso else None
+    if unload is None:
+        return False
+
+    last_session_iso = state.get("last_session_iso")
+    last_session = parse_ts(last_session_iso) if last_session_iso else None
+
+    if has_blocking_sessions():
+        state["last_session_iso"] = now.isoformat()
+        state["last_unload_iso"] = unload_iso
+        if state.get("shutdown_countdown"):
+            log("blocking SSH/tmux activity detected, cancelling shutdown")
+            state["shutdown_countdown"] = False
+        save_state(state)
+        log("blocking sessions present, shutdown countdown paused")
+        return False
+
+    unload_age = now - unload
+    session_age = (
+        (now - last_session) if last_session is not None else timedelta.max
+    )
+
+    if unload_age < timedelta(seconds=SHUTDOWN_GRACE):
+        if state.get("shutdown_countdown"):
+            state["shutdown_countdown"] = False
+            save_state(state)
+        log(
+            f"no sessions, but models unloaded only {unload_age} ago "
+            f"(need {SHUTDOWN_GRACE}s); not shutting down yet"
+        )
+        return False
+
+    if session_age < timedelta(seconds=SSH_GRACE):
+        if state.get("shutdown_countdown"):
+            state["shutdown_countdown"] = False
+            save_state(state)
+        log(
+            f"no sessions, but last session only {session_age} ago "
+            f"(need {SSH_GRACE}s); not shutting down yet"
+        )
+        return False
+
+    log(
+        f"shutdown conditions met: models unloaded {unload_age} ago, "
+        f"last session {session_age} ago. Powering off."
+    )
+    run_shutdown()
+    state["shutdown_countdown"] = False
+    save_state(state)
+    return True
+
+
 def main() -> int:
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
     log(
         f"started: check_interval={CHECK_INTERVAL}s, idle_grace={IDLE_GRACE}s, "
-        f"unit={LOG_UNIT}, action={ACTION}"
+        f"unit={LOG_UNIT}, action={ACTION}, shutdown_grace={SHUTDOWN_GRACE}s, "
+        f"ssh_grace={SSH_GRACE}s, dryrun={SHUTDOWN_DRYRUN}"
     )
 
     while not _stop:
@@ -193,6 +314,11 @@ def main() -> int:
                 continue
 
             if state.get("action_taken"):
+                do_shutdown = check_shutdown(state, now)
+                if do_shutdown:
+                    # shutdown will power off the host; nothing left to do here
+                    time.sleep(CHECK_INTERVAL)
+                    continue
                 time.sleep(CHECK_INTERVAL)
                 continue
 
