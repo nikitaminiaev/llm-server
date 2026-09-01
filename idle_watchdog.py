@@ -316,12 +316,17 @@ def main() -> int:
 
             if prev_seen != last_sleep_iso:
                 log(f"new sleep marker observed at {last_sleep_iso}")
-                state = {
-                    "last_sleep_iso": last_sleep_iso,
-                    "action_taken": False,
-                    "last_action_iso": None,
-                    "last_seen_sleep_iso": last_sleep_iso,
-                }
+                state["last_seen_sleep_iso"] = last_sleep_iso
+
+            if state.get("last_sleep_iso") != last_sleep_iso:
+                # (re)enter the idle-detection cycle for this sleep marker,
+                # even if it was previously seen (state might have been reset
+                # to null while last_seen_sleep_iso still holds this marker).
+                state["last_sleep_iso"] = last_sleep_iso
+                state["action_taken"] = False
+                state["last_action_iso"] = None
+                state["last_unload_iso"] = None
+                state["shutdown_countdown"] = False
                 save_state(state)
 
             if state.get("last_sleep_iso") is None:
