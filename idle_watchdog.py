@@ -23,14 +23,13 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 CHECK_INTERVAL = 60
 IDLE_GRACE = 5 * 60
 LOG_UNIT = "llama-server.service"
 SLEEP_MARKER = "entering sleeping state"
-SLEEP_LINE_RE = re.compile(r"\bsleep\w*", re.IGNORECASE)
 ACTION = "restart"
 
 # Shutdown conditions ---
@@ -40,10 +39,6 @@ SHUTDOWN_GRACE = 60 * 60
 SSH_GRACE = 30 * 60
 SHUTDOWN_CMD = ["sudo", "-n", "shutdown", "-h", "now"]
 SHUTDOWN_DRYRUN = False
-
-
-def is_sleep_line(line: str) -> bool:
-    return bool(SLEEP_LINE_RE.search(line))
 
 STATE_DIR = Path.home() / ".local/state/llama-watcher"
 STATE_FILE = STATE_DIR / "state.json"
@@ -95,15 +90,6 @@ def find_last_sleep() -> datetime | None:
             if ts is not None:
                 last = ts
     return last
-
-
-def has_activity_since(ts: datetime) -> bool:
-    out = journal(since=ts)
-    for line in out.splitlines():
-        if is_sleep_line(line):
-            continue
-        return True
-    return False
 
 
 REQUEST_RE = re.compile(r"\bslot\b.*\brelease\b.*\bstop processing: n_tokens")
@@ -358,8 +344,8 @@ def main() -> int:
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            if has_activity_since(last_sleep):
-                log("activity detected after sleep, waiting for new sleep event")
+            if has_request_activity_since(last_sleep):
+                log("request activity after sleep, waiting for new sleep event")
                 state["last_sleep_iso"] = None
                 state["action_taken"] = False
                 state["last_action_iso"] = None
