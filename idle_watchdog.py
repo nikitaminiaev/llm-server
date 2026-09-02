@@ -11,6 +11,10 @@ SSH session has been active for a grace period, and no tmux session exists,
 the host is powered off (sudo -n shutdown -h now). Any new SSH/tmux activity
 cancels the pending shutdown.
 
+Safety: the host is never powered off unless it has been up for MIN_UPTIME,
+and any shutdown state persisted from a previous boot is cleared on a recent
+reboot. This prevents powering off freshly-booted hosts based on stale state.
+
 Runs as a standalone systemd --user service. Does not modify any existing
 configuration of llama-server.
 """
@@ -39,6 +43,20 @@ SHUTDOWN_GRACE = 60 * 60
 SSH_GRACE = 30 * 60
 SHUTDOWN_CMD = ["sudo", "-n", "shutdown", "-h", "now"]
 SHUTDOWN_DRYRUN = False
+
+# Never consider shutdown until the host has been up at least this long.
+# Prevents bricking the machine right after boot (old state + persistent
+# journal would otherwise trigger an immediate power-off).
+MIN_UPTIME = 30 * 60
+
+
+def uptime_seconds() -> float:
+    """Host uptime in seconds, read from /proc/uptime."""
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return float("inf")
 
 STATE_DIR = Path.home() / ".local/state/llama-watcher"
 STATE_FILE = STATE_DIR / "state.json"
@@ -217,6 +235,11 @@ def check_shutdown(state: dict, now: datetime) -> bool:
     if unload is None:
         return False
 
+    if uptime_seconds() < MIN_UPTIME:
+        log(f"host up only {int(uptime_seconds())}s (< {MIN_UPTIME}s): "
+            "definitely not shutting down this cycle")
+        return False
+
     if has_request_activity_since(unload):
         log("new inference request after unload: models reloaded, "
             "reset shutdown countdown")
@@ -283,8 +306,30 @@ def main() -> int:
     log(
         f"started: check_interval={CHECK_INTERVAL}s, idle_grace={IDLE_GRACE}s, "
         f"unit={LOG_UNIT}, action={ACTION}, shutdown_grace={SHUTDOWN_GRACE}s, "
-        f"ssh_grace={SSH_GRACE}s, dryrun={SHUTDOWN_DRYRUN}"
+        f"ssh_grace={SSH_GRACE}s, min_uptime={MIN_UPTIME}s, "
+        f"dryrun={SHUTDOWN_DRYRUN}"
     )
+
+    # If the host was rebooted recently, any persisted shutdown target from a
+    # previous session is stale. Reset it so a fresh idle cycle starts instead
+    # of powering off right after boot.
+    state = load_state()
+    if uptime_seconds() < MIN_UPTIME and (
+        state.get("action_taken") or state.get("last_unload_iso")
+    ):
+        log(f"recent boot (uptime < {MIN_UPTIME}s): clearing stale shutdown "
+            "state, starting a fresh idle cycle")
+        state.update(
+            {
+                "last_sleep_iso": None,
+                "action_taken": False,
+                "last_action_iso": None,
+                "last_unload_iso": None,
+                "shutdown_countdown": False,
+                "last_session_iso": None,
+            }
+        )
+        save_state(state)
 
     while not _stop:
         try:
@@ -342,9 +387,13 @@ def main() -> int:
                 continue
 
             if not is_service_active():
-                log("service not active, leaving it as-is")
-                state["action_taken"] = True
-                state["last_action_iso"] = now.isoformat()
+                log("service not active, resetting cycle (waiting for server "
+                    "to come up before considering shutdown)")
+                state["last_sleep_iso"] = None
+                state["action_taken"] = False
+                state["last_action_iso"] = None
+                state["last_unload_iso"] = None
+                state["shutdown_countdown"] = False
                 save_state(state)
                 time.sleep(CHECK_INTERVAL)
                 continue
