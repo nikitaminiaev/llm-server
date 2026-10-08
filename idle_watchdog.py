@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Llama-server idle watchdog.
 
-Polls the journal of llama-server.service for the "entering sleeping state"
-marker emitted by llama.cpp's router when a model server becomes idle. After
-a configurable grace period with no further activity, restarts the service
-so the loaded models are dropped from VRAM and the iGPU can power down.
+Polls the journals of the managed units (see UNITS) for the "entering
+sleeping state" marker emitted by llama.cpp when a model server becomes
+idle. After a configurable grace period with no further activity, restarts
+the unit that slept so the loaded models are dropped from VRAM and the iGPU
+can power down. Only the unit owning the freshest sleep marker is tracked;
+when that unit is stopped the cycle resets and waits for another managed
+unit to sleep.
 
 Shutdown logic: once the models have been unloaded (restart happened) and no
 SSH session has been active for a grace period, and no tmux session exists,
@@ -32,7 +35,9 @@ from pathlib import Path
 
 CHECK_INTERVAL = 60
 IDLE_GRACE = 5 * 60
-LOG_UNIT = "llama-server.service"
+# Managed llama-server units; the watchdog tracks the one whose journal has
+# the freshest sleep marker and restarts that unit on idle.
+UNITS = ["llama-server.service", "llama-server-strix.service"]
 SLEEP_MARKER = "entering sleeping state"
 ACTION = "restart"
 
@@ -66,12 +71,12 @@ def log(msg: str) -> None:
     print(f"[llama-watcher] {msg}", flush=True)
 
 
-def journal(since: datetime | None = None) -> str:
+def journal(unit: str, since: datetime | None = None) -> str:
     cmd = [
         "journalctl",
         "--user",
         "-u",
-        LOG_UNIT,
+        unit,
         "--no-pager",
         "-q",
         "--output=short-iso",
@@ -82,7 +87,7 @@ def journal(since: datetime | None = None) -> str:
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         return out.stdout
     except Exception as e:
-        log(f"journalctl failed: {e}")
+        log(f"journalctl failed for {unit}: {e}")
         return ""
 
 
@@ -99,32 +104,53 @@ def parse_ts(line: str) -> datetime | None:
         return None
 
 
-def find_last_sleep() -> datetime | None:
-    out = journal()
-    last: datetime | None = None
-    for line in out.splitlines():
-        if SLEEP_MARKER in line:
-            ts = parse_ts(line)
-            if ts is not None:
-                last = ts
-    return last
+def find_last_sleep(units: list[str]) -> tuple[datetime, str] | None:
+    """Freshest sleep marker across the given units.
+
+    Returns (timestamp, unit) of the newest "entering sleeping state" line
+    found in any of the units' journals, or None if none has ever slept.
+    Only pass *active* units: journals are persistent, so a stopped unit's
+    old marker would otherwise outrank an active unit's newer cycle forever.
+    """
+    best: tuple[datetime, str] | None = None
+    for unit in units:
+        out = journal(unit)
+        for line in out.splitlines():
+            if SLEEP_MARKER in line:
+                ts = parse_ts(line)
+                if ts is None:
+                    continue
+                if best is None or ts > best[0]:
+                    best = (ts, unit)
+    return best
 
 
-REQUEST_RE = re.compile(r"\bslot\b.*\brelease\b.*\bstop processing: n_tokens")
+REQUEST_RE = re.compile(
+    # request accepted by the router (start of an API call)
+    r"proxying request to model"
+    # task started processing (prefill in progress)
+    r"|\bslot\b.*\blaunch_slot_\b.*\bprocessing task\b"
+    # generation finished (legacy marker)
+    r"|\bslot\b.*\brelease\b.*\bstop processing: n_tokens"
+)
 
 
 def has_request_activity_since(ts: datetime) -> bool:
-    """True if a real inference request was served since ts.
+    """True if a real inference request was served on any managed unit since ts.
 
-    Matches only the completion lines emitted when a generation finishes
+    Matches markers of actual API traffic, both at request start (router
+    "proxying request" line, slot "processing task" line) and at completion
     ("slot release ... stop processing: n_tokens = N"). These appear solely
-    for actual requests, not for server startup or model unload, so they are
-    a reliable signal that a model was reloaded and used again after unload.
+    for real requests, not for server startup or model unload, so they are a
+    reliable signal that a model was reloaded and used again after unload.
+    Scans every managed unit so a request to either server cancels a pending
+    reload/shutdown.
     """
-    out = journal(since=ts)
-    for line in out.splitlines():
-        if REQUEST_RE.search(line):
-            return True
+    for unit in UNITS:
+        out = journal(unit, since=ts)
+        for line in out.splitlines():
+            if REQUEST_RE.search(line):
+                return True
     return False
 
 
@@ -142,6 +168,7 @@ def load_state() -> dict:
         "shutdown_countdown": False,
         "last_unload_iso": None,
         "last_session_iso": None,
+        "tracked_unit": None,
     }
 
 
@@ -150,10 +177,10 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def is_service_active() -> bool:
+def is_service_active(unit: str) -> bool:
     try:
         out = subprocess.run(
-            ["systemctl", "--user", "is-active", LOG_UNIT],
+            ["systemctl", "--user", "is-active", unit],
             capture_output=True,
             text=True,
             timeout=10,
@@ -163,11 +190,16 @@ def is_service_active() -> bool:
         return True
 
 
-def run_action() -> None:
-    log(f"running: systemctl --user {ACTION} {LOG_UNIT}")
+def active_units() -> list[str]:
+    """Managed units that are currently active."""
+    return [u for u in UNITS if is_service_active(u)]
+
+
+def run_action(unit: str) -> None:
+    log(f"running: systemctl --user {ACTION} {unit}")
     try:
         subprocess.run(
-            ["systemctl", "--user", ACTION, LOG_UNIT],
+            ["systemctl", "--user", ACTION, unit],
             capture_output=True,
             text=True,
             timeout=120,
@@ -305,7 +337,8 @@ def main() -> int:
 
     log(
         f"started: check_interval={CHECK_INTERVAL}s, idle_grace={IDLE_GRACE}s, "
-        f"unit={LOG_UNIT}, action={ACTION}, shutdown_grace={SHUTDOWN_GRACE}s, "
+        f"units={','.join(UNITS)}, action={ACTION}, "
+        f"shutdown_grace={SHUTDOWN_GRACE}s, "
         f"ssh_grace={SSH_GRACE}s, min_uptime={MIN_UPTIME}s, "
         f"dryrun={SHUTDOWN_DRYRUN}"
     )
@@ -327,6 +360,7 @@ def main() -> int:
                 "last_unload_iso": None,
                 "shutdown_countdown": False,
                 "last_session_iso": None,
+                "tracked_unit": None,
             }
         )
         save_state(state)
@@ -335,34 +369,58 @@ def main() -> int:
         try:
             now = datetime.now()
             state = load_state()
-            last_sleep = find_last_sleep()
+            actives = active_units()
+            found = find_last_sleep(actives)
 
-            if last_sleep is None:
+            if found is None:
+                if not actives and state.get("action_taken"):
+                    # Every managed unit is off after our reload: models are
+                    # out of VRAM, so the shutdown evaluation still applies.
+                    log("no managed unit is active after reload; "
+                        "evaluating shutdown")
+                    check_shutdown(state, now)
+                    time.sleep(CHECK_INTERVAL)
+                    continue
                 if state.get("last_sleep_iso") or state.get("action_taken"):
-                    log("no sleep markers in journal, clearing state")
+                    log("no sleep markers in active units, clearing state")
                     save_state(
                         {
                             "last_sleep_iso": None,
                             "action_taken": False,
                             "last_action_iso": None,
                             "last_seen_sleep_iso": state.get("last_seen_sleep_iso"),
+                            "tracked_unit": None,
                         }
                     )
                 time.sleep(CHECK_INTERVAL)
                 continue
 
+            last_sleep, tracked_unit = found
             last_sleep_iso = last_sleep.isoformat()
             prev_seen = state.get("last_seen_sleep_iso")
 
             if prev_seen != last_sleep_iso:
-                log(f"new sleep marker observed at {last_sleep_iso}")
+                log(f"new sleep marker observed at {last_sleep_iso} "
+                    f"({tracked_unit})")
                 state["last_seen_sleep_iso"] = last_sleep_iso
 
-            if state.get("last_sleep_iso") != last_sleep_iso:
+            if (
+                state.get("last_sleep_iso") != last_sleep_iso
+                or state.get("tracked_unit") != tracked_unit
+            ):
                 # (re)enter the idle-detection cycle for this sleep marker,
                 # even if it was previously seen (state might have been reset
-                # to null while last_seen_sleep_iso still holds this marker).
+                # to null while last_seen_sleep_iso still holds this marker),
+                # or when the tracked unit switched (e.g. llama-server was
+                # stopped and strix became the active server).
+                if (
+                    state.get("tracked_unit")
+                    and state.get("tracked_unit") != tracked_unit
+                ):
+                    log(f"tracked unit switched: {state['tracked_unit']} -> "
+                        f"{tracked_unit}, restarting idle cycle")
                 state["last_sleep_iso"] = last_sleep_iso
+                state["tracked_unit"] = tracked_unit
                 state["action_taken"] = False
                 state["last_action_iso"] = None
                 state["last_unload_iso"] = None
@@ -386,14 +444,16 @@ def main() -> int:
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            if not is_service_active():
-                log("service not active, resetting cycle (waiting for server "
-                    "to come up before considering shutdown)")
+            if not is_service_active(tracked_unit):
+                log(f"unit {tracked_unit} not active, resetting cycle "
+                    "(waiting for server to come up before considering "
+                    "shutdown)")
                 state["last_sleep_iso"] = None
                 state["action_taken"] = False
                 state["last_action_iso"] = None
                 state["last_unload_iso"] = None
                 state["shutdown_countdown"] = False
+                state["tracked_unit"] = None
                 save_state(state)
                 time.sleep(CHECK_INTERVAL)
                 continue
@@ -408,12 +468,13 @@ def main() -> int:
                 continue
 
             log(
-                f"idle confirmed: sleep at {last_sleep_iso}, "
-                f"grace {IDLE_GRACE}s expired, no activity"
+                f"idle confirmed: sleep at {last_sleep_iso} on "
+                f"{tracked_unit}, grace {IDLE_GRACE}s expired, no activity"
             )
-            run_action()
+            run_action(tracked_unit)
             state["action_taken"] = True
             state["last_action_iso"] = now.isoformat()
+            state["tracked_unit"] = tracked_unit
             save_state(state)
 
         except Exception as e:
