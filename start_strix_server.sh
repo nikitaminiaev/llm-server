@@ -4,6 +4,7 @@ MODEL_DIR=~/models/Qwen3.8-Flash-Next
 
 llama-server \
   -m "$MODEL_DIR/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf" \
+  --alias Qwen3.8-Flash-Next-UD-IQ4_XS \
   --mmproj "$MODEL_DIR/mmproj-BF16.gguf" --mmproj-device ROCm0 \
   -dev ROCm0 -ngl all \
   -fa on -fit off --load-mode none --lazy-mode on-direct \
